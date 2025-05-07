@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>My Fantasy Calendar</title>
+  <script src="https://app.fantasy-calendar.com/js/embed.js"></script>
+</head>
+<body>
+  <div id="calendar-container"></div>
+  <script>
+    FantasyCalendar({
+      hash: '38b2f6f114b22086d5bd81a0606b0464',
+      container: '#calendar-container'
+    });
+  </script>
+</body>
+</html>
