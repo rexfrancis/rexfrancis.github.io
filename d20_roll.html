@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>3D D20 Dice Roller</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Pirata+One&display=swap" rel="stylesheet">
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      display: grid;
+      place-items: center;
+      background: #111;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: #fafafa;
+    }
+    .app { display: grid; gap: 10px; place-items: center; }
+    canvas { display: block; }
+    .btn {
+      padding: 10px 16px;
+      font-size: 18px;
+      font-family: inherit;
+      font-weight: 700;
+      border: 1px solid #666666;
+      border-radius: 10px;
+      background: transparent;
+      color: #666666;
+      cursor: pointer;
+      box-shadow: none;
+      transition: transform .06s ease, background-color .15s ease, color .15s ease;
+    }
+    .btn:active { transform: translateY(1px); }
+
+    .frame { width: 720px; height: 360px; display: grid; place-items: center; }
+    .tests-wrap { position: fixed; right: 12px; bottom: 12px; width: 0; height: 0; }
+    .tests-hotspot { position: absolute; right: 0; bottom: 0; width: 64px; height: 40px; }
+    .tests { position: absolute; right: 0; bottom: 0; font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; opacity: 0; max-width: 420px; background: rgba(0,0,0,.55); backdrop-filter: blur(4px); border: 1px solid rgba(255,255,255,.08); border-radius: 10px; padding: 8px 10px; max-height: 45vh; overflow: auto; text-align: left; transform: translateY(6px); pointer-events: none; transition: opacity .15s ease, transform .15s ease; }
+    .tests-wrap:hover .tests { opacity: 1; transform: translateY(0); pointer-events: auto; }
+    .pass { color: #6ee7b7; }
+    .fail { color: #fca5a5; }
+    details summary { cursor: pointer; }
+    .warn { color: #fde68a; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="frame"><div id="stage"></div></div>
+    <div style="display:flex; gap:8px;">
+      <button id="roll1" class="btn" aria-label="Roll 1d20">1d20</button>
+      <button id="roll2" class="btn" aria-label="Roll 2d20">2d20</button>
+    </div>
+    <div class="tests-wrap"><div class="tests-hotspot" aria-hidden="true"></div><details class="tests" id="self-tests"><summary>Self Tests</summary>
+      <div id="test-results">Running tests...</div>
+    </details></div>
+
+  <!-- Add crossorigin so external script errors are not masked as "Script error" -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.157.0/build/three.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/troika-three-text@0.49.0/dist/troika-three-text.umd.js" crossorigin="anonymous"></script>
+
+  <script>
+    // Robust in page error reporting with more context
+    const testElInit = document.getElementById('test-results');
+    function reportInit(ok, msg, cls) {
+      if (!testElInit) return;
+      const p = document.createElement('div');
+      p.className = ok ? (cls || 'pass') : 'fail';
+      p.textContent = (ok ? 'PASS' : 'FAIL') + ': ' + msg;
+      testElInit.appendChild(p);
+    }
+    window.addEventListener('error', e => {
+      const file = e && e.filename ? ' at ' + e.filename : '';
+      const loc = e && e.lineno ? ' line ' + e.lineno + ':' + (e.colno || 0) : '';
+      reportInit(false, 'window.onerror: ' + (e && e.message ? e.message : String(e)) + file + loc);
+    });
+    window.addEventListener('unhandledrejection', e => {
+      const r = e && e.reason ? e.reason : 'unknown rejection';
+      const msg = r && r.message ? r.message : String(r);
+      reportInit(false, 'unhandledrejection: ' + msg);
+    });
+
+    // Guard external deps early
+    if (typeof THREE === 'undefined') {
+      throw new Error('THREE failed to load. Check network or CDN permissions.');
+    }
+
+    // Scene boot inside a protective try catch so cross origin errors surface here
+    let scene, camera, renderer;
+    let die;
+    let die2 = null; // created on demand
+    let mat2 = null;
+    let hueState2 = null;
+    const anims = {}; // per-die animation handles
+    let faceNormals = [], faceRefVecs = [], faceCenters = [];
+    let faceNumbers = [], faceLabels = [];
+    let anim = null;
+
+    try {
+      // Scene
+      const root = document.getElementById('stage');
+      if (!root) throw new Error('#stage element not found');
+      const rect0 = root.getBoundingClientRect();
+      const W = Math.max((rect0 && rect0.width) ? Math.floor(rect0.width) : 720, 360);
+      const H = Math.max((rect0 && rect0.height) ? Math.floor(rect0.height) : 360, 240);
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(40, W/H, 0.1, 100);
+      camera.position.set(0, 0, 6);
+
+      // Create renderer
+      try {
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      } catch (e) {
+        reportInit(false, 'WebGLRenderer failed, WebGL may be unavailable: ' + (e && e.message ? e.message : e), 'warn');
+        throw e;
+      }
+      renderer.setSize(W, H);
+      renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+      root.appendChild(renderer.domElement);
+
+      // Lights
+      scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+      const key = new THREE.DirectionalLight(0xffffff, 1.0);
+      key.position.set(3, 4, 5);
+      scene.add(key);
+      const rim = new THREE.DirectionalLight(0xffffff, 0.5);
+      rim.position.set(-4, -2, -3);
+      scene.add(rim);
+
+      // D20 geometry
+      const radius = 1.4;
+      const geo = new THREE.IcosahedronGeometry(radius, 0); // 20 triangular faces
+
+      // Mesh material
+      const mat = new THREE.MeshStandardMaterial({ color: 0x1e90ff, metalness: 0.2, roughness: 0.5, flatShading: true });
+      // Base HSL so we can animate hue
+      const initH = 0.56, initS = 0.65, initL = 0.5; // start near dodger blue
+      mat.color.setHSL(initH, initS, initL);
+      const hueState = { h: initH, s: initS, l: initL };
+      die = new THREE.Mesh(geo, mat);
+      // No outline lines, rely on flat shading for form
+      scene.add(die);
+
+      function addLabelsToDie(dieTarget, radius) {
+        // Detect a reliable Troika before using it, otherwise fall back to canvas labels
+        let TROIKA_OK2 = false; let TroikaTextClass2 = null;
+        try {
+          TroikaTextClass2 = (window.TroikaThreeText && window.TroikaThreeText.Text) || (window.Troika && window.Troika.Text) || null;
+          if (TroikaTextClass2) {
+            const probe = new TroikaTextClass2();
+            probe.text = '0';
+            if (typeof probe.sync === 'function') TROIKA_OK2 = true;
+          }
+        } catch (_) { TROIKA_OK2 = false; }
+        for (let f = 0; f < faceNumbers.length; f++) {
+          const num = faceNumbers[f];
+          const normal = faceNormals[f];
+          const center = faceCenters[f];
+          const upRef = faceRefVecs[f];
+          if (TROIKA_OK2 && TroikaTextClass2) {
+            const txt = new TroikaTextClass2();
+            txt.text = String(num);
+            txt.font = 'Pirata One';
+            txt.fontSize = radius * 0.286;
+            txt.color = 0xffffff;
+            txt.anchorX = 'center';
+            txt.anchorY = 'middle';
+            const qAlign = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), normal);
+            const xRef = new THREE.Vector3(1,0,0).applyQuaternion(qAlign);
+            const angle = Math.atan2(xRef.clone().cross(upRef).dot(normal), xRef.dot(upRef));
+            const qTwist = new THREE.Quaternion().setFromAxisAngle(normal, angle);
+            txt.quaternion.copy(qTwist.multiply(qAlign));
+            txt.position.copy(center.clone().add(normal.clone().multiplyScalar(0.01)));
+            dieTarget.add(txt);
+            if (typeof txt.sync === 'function') txt.sync();
+          } else {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0,0,256,256);
+            ctx.font = 'bold 234px "Pirata One", system-ui, Arial, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(String(num), 128, 148);
+            const tex = new THREE.CanvasTexture(canvas);
+            const m = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+            const plane = new THREE.Mesh(new THREE.PlaneGeometry(radius * 0.455, radius * 0.455), m);
+            const qAlign = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), normal);
+            const xRef = new THREE.Vector3(1,0,0).applyQuaternion(qAlign);
+            const angle = Math.atan2(xRef.clone().cross(upRef).dot(normal), xRef.dot(upRef));
+            const qTwist = new THREE.Quaternion().setFromAxisAngle(normal, angle);
+            plane.quaternion.copy(qTwist.multiply(qAlign));
+            plane.position.copy(center.clone().add(normal.clone().multiplyScalar(0.01)));
+            dieTarget.add(plane);
+          }
+        }
+      }
+
+      function buildSecondDie() {
+        if (die2) return;
+        const radius = 1.4;
+        const geo2 = new THREE.IcosahedronGeometry(radius, 0);
+        mat2 = new THREE.MeshStandardMaterial({ color: 0xff4d4d, metalness: 0.2, roughness: 0.5, flatShading: true });
+        hueState2 = { h: 0.0, s: 0.65, l: 0.5 };
+        mat2.color.setHSL(hueState2.h, hueState2.s, hueState2.l);
+        die2 = new THREE.Mesh(geo2, mat2);
+        addLabelsToDie(die2, radius);
+        die2.position.set(1.6, 0, 0);
+        scene.add(die2);
+      }
+
+      // Precompute face data
+      const pos = geo.attributes.position;
+      const indexAttr = geo.index; // may be null on some versions
+      const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+      const ab = new THREE.Vector3(), ac = new THREE.Vector3();
+      const triCount = indexAttr ? (indexAttr.count / 3) : (pos.count / 3);
+      function idx(i) { return indexAttr ? indexAttr.getX(i) : i; }
+
+      for (let f = 0; f < triCount; f++) {
+        const i0 = idx(f * 3), i1 = idx(f * 3 + 1), i2 = idx(f * 3 + 2);
+        a.fromBufferAttribute(pos, i0);
+        b.fromBufferAttribute(pos, i1);
+        c.fromBufferAttribute(pos, i2);
+        ab.subVectors(b, a);
+        ac.subVectors(c, a);
+        const n = new THREE.Vector3().crossVectors(ab, ac).normalize();
+        faceNormals.push(n.clone());
+        const ref = ab.clone().normalize();
+        ref.sub(n.clone().multiplyScalar(ref.dot(n))).normalize();
+        faceRefVecs.push(ref);
+      }
+
+      // Compute centers, assign numbers 1..20, and build labels that move with the die
+      (function setupFaceLabels(){
+        if (faceCenters.length === 0) {
+          for (let f = 0; f < triCount; f++) {
+            const i0 = idx(f * 3), i1 = idx(f * 3 + 1), i2 = idx(f * 3 + 2);
+            const va = new THREE.Vector3().fromBufferAttribute(pos, i0);
+            const vb = new THREE.Vector3().fromBufferAttribute(pos, i1);
+            const vc = new THREE.Vector3().fromBufferAttribute(pos, i2);
+            const center = new THREE.Vector3().addVectors(va, vb).add(vc).multiplyScalar(1/3);
+            faceCenters.push(center);
+          }
+        }
+        faceNumbers = Array.from({length: triCount}, (_, i) => i + 1);
+
+        // Detect a reliable Troika before using it, otherwise fall back to canvas labels
+        let TROIKA_OK = false; let TroikaTextClass = null;
+        try {
+          TroikaTextClass = (window.TroikaThreeText && window.TroikaThreeText.Text) || (window.Troika && window.Troika.Text) || null;
+          if (TroikaTextClass) {
+            // Probe construct to catch environments where worker utils are absent
+            const probe = new TroikaTextClass();
+            probe.text = '0';
+            if (typeof probe.sync === 'function') TROIKA_OK = true;
+          }
+        } catch (e) {
+          TROIKA_OK = false;
+          reportInit(false, 'Troika text unavailable, using canvas labels: ' + (e && e.message ? e.message : e), 'warn');
+        }
+
+        for (let f = 0; f < triCount; f++) {
+          const num = faceNumbers[f];
+          const normal = faceNormals[f];
+          const center = faceCenters[f];
+          const upRef = faceRefVecs[f];
+          let labelObj;
+          if (TROIKA_OK && TroikaTextClass) {
+            const txt = new TroikaTextClass();
+            txt.text = String(num);
+            txt.font = 'Pirata One';
+            txt.fontSize = radius * 0.286; // white labels, slightly larger
+            txt.color = 0xffffff;
+            txt.outlineWidth = 0.0;
+            txt.outlineColor = 0x000000;
+            txt.anchorX = 'center';
+            txt.anchorY = 'middle';
+            const qAlign = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), normal);
+            const xRef = new THREE.Vector3(1,0,0).applyQuaternion(qAlign);
+            const angle = Math.atan2(xRef.clone().cross(upRef).dot(normal), xRef.dot(upRef));
+            const qTwist = new THREE.Quaternion().setFromAxisAngle(normal, angle);
+            txt.quaternion.copy(qTwist.multiply(qAlign));
+            txt.position.copy(center.clone().add(normal.clone().multiplyScalar(0.01)));
+            die.add(txt);
+            labelObj = txt;
+            if (typeof txt.sync === 'function') txt.sync();
+          } else {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0,0,256,256);
+            ctx.font = 'bold 234px "Pirata One", system-ui, Arial, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.lineWidth = 0; ctx.strokeStyle = 'rgba(0,0,0,0)';
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(String(num), 128, 148);
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+            const plane = new THREE.Mesh(new THREE.PlaneGeometry(radius * 0.455, radius * 0.455), mat);
+            const qAlign = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), normal);
+            const xRef = new THREE.Vector3(1,0,0).applyQuaternion(qAlign);
+            const angle = Math.atan2(xRef.clone().cross(upRef).dot(normal), xRef.dot(upRef));
+            const qTwist = new THREE.Quaternion().setFromAxisAngle(normal, angle);
+            plane.quaternion.copy(qTwist.multiply(qAlign));
+            plane.position.copy(center.clone().add(normal.clone().multiplyScalar(0.01)));
+            die.add(plane);
+            labelObj = plane;
+          }
+          faceLabels.push(labelObj);
+        }
+      })();
+
+      // Animation loop
+      function tick() {
+        requestAnimationFrame(tick);
+        renderer.render(scene, camera);
+      }
+      tick();
+
+      // Helpers
+      function slerpQ(outQuat, qa, qb, t) {
+        if (outQuat && typeof outQuat.slerpQuaternions === 'function') {
+          outQuat.slerpQuaternions(qa, qb, t);
+        } else if (THREE.Quaternion && typeof THREE.Quaternion.slerp === 'function') {
+          THREE.Quaternion.slerp(qa, qb, outQuat, t);
+        } else {
+          outQuat.set(
+            (1 - t) * qa.x + t * qb.x,
+            (1 - t) * qa.y + t * qb.y,
+            (1 - t) * qa.z + t * qb.z,
+            (1 - t) * qa.w + t * qb.w
+          ).normalize();
+        }
+        return outQuat;
+      }
+      function easeInOutCubic(p){ return p < 0.5 ? 4*p*p*p : 1 - Math.pow(-2*p + 2, 3) / 2; }
+      function mod1(x){ return (x % 1 + 1) % 1; }
+      function shortestHueDelta(from, to){ let d = mod1(to - from); if (d > 0.5) d -= 1; return d; }
+      const MIN_HUE_SEPARATION = 0.12;
+
+      const FRONT = new THREE.Vector3(0, 0, 1);
+
+      function targetQuaternionForFace(faceIndex) {
+        const n = faceNormals[faceIndex];
+        const ref = faceRefVecs[faceIndex];
+        const qToFront = new THREE.Quaternion().setFromUnitVectors(n, FRONT);
+        const refWorld = ref.clone().applyQuaternion(qToFront);
+        const baseAngle = Math.atan2(refWorld.y, refWorld.x);
+        const qTwist = new THREE.Quaternion().setFromAxisAngle(FRONT, -baseAngle);
+        return qTwist.multiply(qToFront);
+      }
+      function ensureEdgeHorizontal(qIn, faceIndex) {
+        const ref = faceRefVecs[faceIndex];
+        const refWorld = ref.clone().applyQuaternion(qIn);
+        const delta = Math.atan2(refWorld.y, refWorld.x);
+        if (Math.abs(delta) < 1e-12) return qIn;
+        const twistFix = new THREE.Quaternion().setFromAxisAngle(FRONT, -delta);
+        return twistFix.multiply(qIn);
+      }
+
+      // Spin and land
+      const btn1 = document.getElementById('roll1');
+      const btn2 = document.getElementById('roll2');
+      
+      function rollDie(targetMesh, targetMat, targetHue, forcedFaceIndex, animKey, avoidHue) {
+        const faceIndex = (typeof forcedFaceIndex === 'number') ? forcedFaceIndex : Math.floor(Math.random() * faceNormals.length);
+        const result = faceNumbers[faceIndex];
+        // Timing: single phase ~6s
+        const spinDuration = 6000;
+        const settleDuration = 0;
+        const startQ = targetMesh.quaternion.clone();
+        // Plan next hue change across the roll duration
+        let nextHue, dHue, endHueTmp;
+        do {
+          nextHue = Math.random();
+          dHue = shortestHueDelta(targetHue.h, nextHue);
+          endHueTmp = mod1(targetHue.h + dHue);
+        } while (Math.abs(dHue) < 0.15 || (typeof avoidHue === 'number' && Math.abs(shortestHueDelta(endHueTmp, avoidHue)) < MIN_HUE_SEPARATION));
+        const startHue = targetHue.h;
+        const endHueUnwrapped = startHue + dHue;
+        const plannedEndHue = mod1(endHueUnwrapped);
+        const settleQ = ensureEdgeHorizontal(targetQuaternionForFace(faceIndex).clone(), faceIndex);
+        const spinDir = Math.random() < 0.5 ? -1 : 1;
+        const deltaQ = settleQ.clone().multiply(startQ.clone().invert()).normalize();
+        const clamp = THREE.MathUtils.clamp;
+        let baseAngle = 2 * Math.acos(clamp(deltaQ.w, -1, 1));
+        baseAngle = isNaN(baseAngle) ? 0 : baseAngle;
+        let axis = new THREE.Vector3(deltaQ.x, deltaQ.y, deltaQ.z);
+        let s = Math.sqrt(Math.max(1e-12, 1 - deltaQ.w * deltaQ.w));
+        if (s > 1e-6) { axis.divideScalar(s); } else { axis.set(1, 0, 0); }
+        axis.normalize();
+        const k = 6 + Math.floor(Math.random() * 2);
+        const randAngle = baseAngle + spinDir * (Math.PI * 2 * k);
+        const randAxis = axis.clone();
+        const startTime = performance.now();
+        const wobAxis = new THREE.Vector3(Math.random(), Math.random(), Math.random()).normalize();
+        const wobAmp = 0.035;
+        const wobFreq = 18.0;
+        const tiltAmp = 0.09;
+        const tiltFreq = 2.0;
+        const phaseP = Math.random() * Math.PI * 2;
+        const phaseY = Math.random() * Math.PI * 2;
+        // extra random-axis spin that cancels at the end, for more varied axes
+        const axisExtra = new THREE.Vector3(Math.random(), Math.random(), Math.random()).normalize();
+        const extraTurns = 1 + Math.floor(Math.random() * 2); // 1..2 turns, subtler
+        const extraScale = 0.4;
+        
+        // cancel existing anim for this key
+        if (anims[animKey]) cancelAnimationFrame(anims[animKey]);
+        function animate(now) {
+          const t = now - startTime;
+          if (t < spinDuration) {
+            const p = t / spinDuration;
+            const e = easeInOutCubic(p);
+            const angleNow = randAngle * e;
+            const baseQ = new THREE.Quaternion().setFromAxisAngle(randAxis, angleNow).multiply(startQ);
+            const hNow = mod1(startHue + dHue * e);
+            targetMat.color.setHSL(hNow, targetHue.s, targetHue.l);
+            const decay = (1 - p) * (1 - p);
+            const wob = wobAmp * decay * Math.sin(p * wobFreq);
+            const wobQ = new THREE.Quaternion().setFromAxisAngle(wobAxis, wob);
+            const pitch = tiltAmp * decay * Math.sin(phaseP + p * Math.PI * 2 * tiltFreq);
+            const yaw = (tiltAmp * 0.8) * decay * Math.cos(phaseY + p * Math.PI * 2 * tiltFreq);
+            const pitchQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), pitch);
+            const yawQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), yaw);
+            // extra mid-roll spin: goes 0 -> many turns -> 0, so endpoint stays exact
+            const loop = Math.sin(Math.PI * e); // 0..1..0
+            const extraAngle = loop * Math.PI * 2 * extraTurns * extraScale;
+            const extraQ = new THREE.Quaternion().setFromAxisAngle(axisExtra, extraAngle);
+            targetMesh.quaternion.copy(wobQ.multiply(yawQ).multiply(pitchQ).multiply(extraQ).multiply(baseQ));
+            anims[animKey] = requestAnimationFrame(animate);
+          } else {
+            const finalQ = ensureEdgeHorizontal(targetQuaternionForFace(faceIndex).clone(), faceIndex);
+            targetMesh.quaternion.copy(finalQ);
+            targetHue.h = mod1(endHueUnwrapped);
+            anims[animKey] = null;
+          }
+        }
+        anims[animKey] = requestAnimationFrame(animate);
+        return { faceIndex, result, endHue: plannedEndHue };
+      }
+      
+      function rollOnce() {
+        const faceIndex = Math.floor(Math.random() * faceNormals.length);
+        const result = faceNumbers[faceIndex];
+        window.__lastResult = result;
+        window.__lastFaceIndex = faceIndex;
+
+        // Timing: single phase ~6s
+        const spinDuration = 6000;
+        const settleDuration = 0;
+        const startQ = die.quaternion.clone();
+
+        // Plan next hue change across the roll duration
+        let nextHue, dHue;
+        do {
+          nextHue = Math.random();
+          dHue = shortestHueDelta(hueState.h, nextHue);
+        } while (Math.abs(dHue) < 0.15); // ensure a visible shift
+        const startHue = hueState.h;
+        const endHueUnwrapped = startHue + dHue;
+        window.__colorPlan = { startHue, nextHue, dHue };
+
+        const settleQ = ensureEdgeHorizontal(targetQuaternionForFace(faceIndex).clone(), faceIndex);
+
+        // Plan spin that ends exactly at target modulo full turns
+        const spinDir = Math.random() < 0.5 ? -1 : 1;
+        const deltaQ = settleQ.clone().multiply(startQ.clone().invert()).normalize();
+        const clamp = THREE.MathUtils.clamp;
+        let baseAngle = 2 * Math.acos(clamp(deltaQ.w, -1, 1));
+        baseAngle = isNaN(baseAngle) ? 0 : baseAngle;
+        let axis = new THREE.Vector3(deltaQ.x, deltaQ.y, deltaQ.z);
+        let s = Math.sqrt(Math.max(1e-12, 1 - deltaQ.w * deltaQ.w));
+        if (s > 1e-6) { axis.divideScalar(s); } else { axis.set(1, 0, 0); }
+        axis.normalize();
+        const k = 6 + Math.floor(Math.random() * 2); // 6..7 extra spins
+        const randAngle = baseAngle + spinDir * (Math.PI * 2 * k);
+        const randAxis = axis.clone();
+        const plannedEnd = new THREE.Quaternion().setFromAxisAngle(randAxis, randAngle).multiply(startQ);
+        const dotPlan = Math.abs(plannedEnd.x*settleQ.x + plannedEnd.y*settleQ.y + plannedEnd.z*settleQ.z + plannedEnd.w*settleQ.w);
+        window.__plan = { plannedMatchesTarget: (1 - dotPlan) < 1e-6, k };
+
+        const startTime = performance.now();
+        window.__timing = { spinDuration, settleDuration };
+
+        const wobAxis = new THREE.Vector3(Math.random(), Math.random(), Math.random()).normalize();
+        const wobAmp = 0.035;
+        const wobFreq = 18.0;
+        // subtle pitch and yaw that decay toward zero, adds life during the roll
+        const tiltAmp = 0.09; // radians, small
+        const tiltFreq = 2.0; // cycles over the roll
+        const phaseP = Math.random() * Math.PI * 2;
+        const phaseY = Math.random() * Math.PI * 2;
+        // extra random-axis spin parameters
+        const axisExtra = new THREE.Vector3(Math.random(), Math.random(), Math.random()).normalize();
+        const extraTurns = 1 + Math.floor(Math.random() * 2);
+        const extraScale = 0.4;
+        window.__spinParams = { randAngle, wobAmp, wobFreq: 18, spinDir, tiltAmp, tiltFreq, phaseP, phaseY, extraTurns, extraScale };
+
+        function animate(now) {
+          const t = now - startTime;
+          if (t < spinDuration) {
+            const p = t / spinDuration;
+            const e = easeInOutCubic(p);
+            const angleNow = randAngle * e;
+            const baseQ = new THREE.Quaternion().setFromAxisAngle(randAxis, angleNow).multiply(startQ);
+            // Update material hue along the same easing
+            const hNow = mod1(startHue + dHue * e);
+            mat.color.setHSL(hNow, hueState.s, hueState.l);
+            const decay = (1 - p) * (1 - p);
+            const wob = wobAmp * decay * Math.sin(p * wobFreq);
+            const wobQ = new THREE.Quaternion().setFromAxisAngle(wobAxis, wob);
+            const pitch = tiltAmp * decay * Math.sin(phaseP + p * Math.PI * 2 * tiltFreq);
+            const yaw = (tiltAmp * 0.8) * decay * Math.cos(phaseY + p * Math.PI * 2 * tiltFreq);
+            const pitchQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), pitch);
+            const yawQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), yaw);
+            const loop = Math.sin(Math.PI * e);
+            const extraAngle = loop * Math.PI * 2 * extraTurns * extraScale;
+            const extraQ = new THREE.Quaternion().setFromAxisAngle(axisExtra, extraAngle);
+            die.quaternion.copy(wobQ.multiply(yawQ).multiply(pitchQ).multiply(extraQ).multiply(baseQ));
+            anim = requestAnimationFrame(animate);
+          } else {
+            const finalQ = ensureEdgeHorizontal(targetQuaternionForFace(faceIndex).clone(), faceIndex);
+            die.quaternion.copy(finalQ);
+            hueState.h = mod1(endHueUnwrapped);
+            window.__smoothParams = { seamless: true };
+            anim = null;
+          }
+        }
+        anim = requestAnimationFrame(animate);
+      }
+
+      btn1.addEventListener('click', () => {
+        // single die roll, center primary and hide second if exists
+        if (anims.d1 || anims.d2) return;
+        if (die2) die2.visible = false;
+        die.position.set(0,0,0);
+        rollDie(die, mat, hueState, undefined, 'd1');
+      });
+
+      btn2.addEventListener('click', () => {
+        if (anims.d1 || anims.d2) return;
+        buildSecondDie();
+        die.visible = true; die2.visible = true;
+        die.position.set(-1.6, 0, 0);
+        die2.position.set(1.6, 0, 0);
+        const first = rollDie(die, mat, hueState, undefined, 'd1');
+        // ensure different face for second
+        let face2 = Math.floor(Math.random() * faceNormals.length);
+        if (face2 === first.faceIndex) face2 = (face2 + 1) % faceNormals.length;
+        rollDie(die2, mat2, hueState2, face2, 'd2', first.endHue);
+      });
+
+      // Resize
+      function onResize() {
+        const rect = root.getBoundingClientRect();
+        const w = Math.max(360, Math.floor(rect.width || 720));
+        const h = Math.max(240, Math.floor(rect.height || 360));
+        renderer.setSize(w, h, false);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      }
+      window.addEventListener('resize', onResize);
+      onResize();
+
+      // -----------------------------
+      // Self tests
+      // -----------------------------
+      const testEl = document.getElementById('test-results');
+      function report(ok, msg) {
+        const p = document.createElement('div');
+        p.className = ok ? 'pass' : 'fail';
+        p.textContent = (ok ? 'PASS' : 'FAIL') + ': ' + msg;
+        testEl.appendChild(p);
+      }
+      function nearlyEqualVec3(a, b, eps = 1e-3) {
+        return Math.abs(a.x - b.x) < eps && Math.abs(a.y - b.y) < eps && Math.abs(a.z - b.z) < eps;
+      }
+
+      (function runTests(){
+        testEl.textContent = '';
+        try {
+          // T1: geometry yields 20 faces
+          const triCount = (geo.index ? geo.index.count/3 : geo.attributes.position.count/3);
+          report(triCount === 20, `triCount is 20, got ${triCount}`);
+          report(faceNormals.length === triCount, `faceNormals length matches triCount (${faceNormals.length})`);
+
+          // T2: target quaternion aligns first few faces to FRONT
+          const tmp = new THREE.Vector3();
+          let alignOk = true;
+          for (let f = 0; f < Math.min(5, triCount); f++) {
+            const q = targetQuaternionForFace(f);
+            tmp.copy(faceNormals[f]).applyQuaternion(q);
+            if (!nearlyEqualVec3(tmp, FRONT)) alignOk = false;
+          }
+          report(alignOk, 'faces align perpendicular to view');
+
+          // T3: labels exist for each face and parented to die
+          const labelsOk = faceLabels.length === triCount && faceLabels.every(l => l.parent === die);
+          report(labelsOk, 'labels exist and follow die');
+
+          // T4: rollOnce picks a face, and there is no separate result element
+          rollOnce();
+          const last = window.__lastResult;
+          const lastFace = window.__lastFaceIndex;
+          const noResultEl = document.getElementById('result') == null;
+          report(typeof last === 'number' && last === faceNumbers[lastFace] && noResultEl, 'rollOnce selects a face, no separate result element present');
+
+          // T4b: UI has two buttons
+          const okBtns = !!document.getElementById('roll1') && !!document.getElementById('roll2');
+          report(okBtns, 'both roll buttons exist');
+
+          // T4c: 2d20 creates a second die
+          const before = !!die2;
+          const click2 = document.getElementById('roll2');
+          click2.click();
+          setTimeout(() => {
+            const after = !!die2;
+            report(!before && after, 'second die created on Roll 2d20');
+            // T4d: canvas widened enough for two dice
+            const c = document.querySelector('#stage canvas');
+            if (c) {
+              report(c.width >= 600, `canvas width >= 600 for two dice (got ${c.width})`);
+            }
+          }, 50);
+          setTimeout(() => {
+            // T4e: ensure hues differ by at least MIN_HUE_SEPARATION
+            if (mat2) {
+              const h1 = {}; mat.color.getHSL(h1);
+              const h2 = {}; mat2.color.getHSL(h2);
+              const sep = Math.abs(shortestHueDelta(h1.h, h2.h));
+              report(sep >= (MIN_HUE_SEPARATION - 0.01), `2d20 hues separated >= ${MIN_HUE_SEPARATION} (got ${sep.toFixed(3)})`);
+            }
+          }, 6500);
+
+          // T5: duration ~6s and plan lands exactly on target
+          const tm = window.__timing; const plan = window.__plan;
+          const totalMs = tm ? (tm.spinDuration + tm.settleDuration) : 0;
+          report(tm && totalMs >= 5800 && totalMs <= 6200, `total duration ~6s (got ${totalMs}ms)`);
+          report(!!plan && plan.plannedMatchesTarget, 'planned spin ends exactly at target');
+          // T5b: color plan exists and will change hue noticeably
+          const cp = window.__colorPlan;
+          report(!!cp && Math.abs(cp.dHue) >= 0.15, 'color plan has visible hue delta');
+          // T5c: verify hue changes over time and lands at a new hue
+          const startHex = mat.color.getHex();
+          setTimeout(() => {
+            const midHex = mat.color.getHex();
+            report(midHex !== startHex, 'material color is animating');
+          }, 1500);
+          setTimeout(() => {
+            const endHex = mat.color.getHex();
+            report(endHex !== startHex, 'material color finished at a different hue');
+          }, 6400);
+          // T6: tilt parameters exist for dynamic pitch and yaw
+          const sp = window.__spinParams;
+          report(!!sp && sp.tiltAmp > 0 && sp.tiltFreq > 0, 'tilt parameters present for subtle pitch/yaw');
+        } catch (e) {
+          report(false, 'Exception during tests: ' + (e && e.message ? e.message : e));
+        }
+      })();
+    } catch (bootErr) {
+      reportInit(false, 'Boot failure: ' + (bootErr && bootErr.message ? bootErr.message : bootErr));
+      console.error(bootErr);
+    }
+  </script>
+</body>
+</html>
